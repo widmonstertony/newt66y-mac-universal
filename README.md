@@ -22,17 +22,17 @@ conversion of an iOS IPA.
 ### 首次安装
 
 1. 从 [GitHub Releases](https://github.com/widmonstertony/newt66y-mac-universal/releases/latest)
-   下载 `NewT66y-Mac-Universal-v1.3.0.zip`。
+   下载 `NewT66y-Mac-Universal-v1.4.0.zip`。
 2. 可选但推荐：在终端校验下载文件：
 
    ```bash
-   shasum -a 256 NewT66y-Mac-Universal-v1.3.0.zip
+   shasum -a 256 NewT66y-Mac-Universal-v1.4.0.zip
    ```
 
    正确结果应为：
 
    ```text
-   5911d9a3444dbeb221e7bfbb77f81a9a41451bbfd1704c4a697f9b42bdd76113
+   6f7b6289edf45421abcbd5a0cbb78cc43dfa2d791adaad66d3f233afbf096c74
    ```
 
 3. 双击 ZIP 解压。
@@ -67,18 +67,18 @@ file "/Applications/小草 Mac 浏览器.app/Contents/MacOS/NewT66yIntel"
 
 ### First installation
 
-1. Download `NewT66y-Mac-Universal-v1.3.0.zip` from
+1. Download `NewT66y-Mac-Universal-v1.4.0.zip` from
    [GitHub Releases](https://github.com/widmonstertony/newt66y-mac-universal/releases/latest).
 2. Optionally verify the download in Terminal:
 
    ```bash
-   shasum -a 256 NewT66y-Mac-Universal-v1.3.0.zip
+   shasum -a 256 NewT66y-Mac-Universal-v1.4.0.zip
    ```
 
    Expected SHA-256:
 
    ```text
-   5911d9a3444dbeb221e7bfbb77f81a9a41451bbfd1704c4a697f9b42bdd76113
+   6f7b6289edf45421abcbd5a0cbb78cc43dfa2d791adaad66d3f233afbf096c74
    ```
 
 3. Double-click the ZIP to extract it.
@@ -97,7 +97,7 @@ ID, so a first-launch confirmation is expected.
 
 1. Quit the old application.
 2. Move the new `小草 Mac 浏览器.app` into `Applications`.
-3. After confirming that v1.3.0 opens correctly, you may remove the old
+3. After confirming that v1.4.0 opens correctly, you may remove the old
    `小草 Intel 浏览器.app` to avoid launching the wrong copy. The new app keeps
    the same bundle identifier.
 
@@ -116,13 +116,22 @@ The result should list both `x86_64` and `arm64`.
 - 按原 iOS 版布局重建首页和底部导航。
 - 原生 WKWebView、触控板历史手势、后退、前进、刷新和站内导航。
 - Safari 风格的 AVKit Touch Bar 播放、进度、画中画和全屏控制。
-- 修复播放开始后 Touch Bar 全屏键消失的问题。
+- 真正使用 AVKit 原生视频解码与播放，网页播放器的中央播放遮罩不会留在全屏画面上。
+- Touch Bar 全屏键在播放及全屏状态下保持可见，并切换为退出全屏。
+- 退出全屏后恢复原网页、视频进度、滚动位置和返回栈。
+- 每个视频只显示一个 VidCatch 下载按钮。
 - 原生视频全屏，以及原生全屏失败时的纯视频影院模式。
 - VidCatch companion 下载按钮；普通文件下载保存到 `~/Downloads`。
 - Recreated iOS-style home screen and bottom navigation.
 - Native WKWebView navigation and trackpad history gestures.
 - Safari-style AVKit Touch Bar playback, scrubber, Picture in Picture and
   fullscreen controls.
+- Native AVKit playback removes the webpage's stale central play overlay.
+- The Touch Bar fullscreen toggle remains available during playback and
+  fullscreen, and changes to an exit-fullscreen control.
+- Exiting fullscreen restores the original webpage, playback position, scroll
+  position, and browser back stack.
+- Exactly one VidCatch download button is shown per video.
 - Native video fullscreen with a video-only fallback mode.
 
 ## 视频下载 / Video downloads
@@ -151,7 +160,7 @@ installations for the companion.
 
 ```text
 dist/小草 Mac 浏览器.app
-dist/NewT66y-Mac-Universal-v1.3.0.zip
+dist/NewT66y-Mac-Universal-v1.4.0.zip
 ```
 
 构建脚本会验证主程序同时包含 `x86_64` 和 `arm64`，并对 App 进行 ad-hoc 签名。

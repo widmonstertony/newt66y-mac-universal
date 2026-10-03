@@ -2,6 +2,7 @@
 #import <WebKit/WebKit.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -90,10 +91,24 @@ static BOOL TGLoadMacAVKit(void) {
 
 @interface TGAppDelegate : NSObject
     <NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate,
-     WKScriptMessageHandler, WKDownloadDelegate>
+     WKScriptMessageHandler, WKDownloadDelegate, AVPlayerViewDelegate>
 
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, strong) AVPlayerView *nativePlayerView;
+@property(nonatomic, strong) AVPlayer *nativePlayer;
+@property(nonatomic, strong) AVPlayerItem *nativePlayerItem;
+@property(nonatomic, strong) id nativeTimeObserver;
+@property(nonatomic, strong) NSButton *nativeDownloadButton;
+@property(nonatomic, copy) NSDictionary *nativeDownloadMessage;
+@property(nonatomic, copy) NSURL *nativeMediaURL;
+@property(nonatomic) NSTimeInterval nativePendingStartTime;
+@property(nonatomic) NSUInteger nativePlaybackGeneration;
+@property(nonatomic) BOOL nativePlaybackActive;
+@property(nonatomic) BOOL observingNativePlayerItem;
+@property(nonatomic) BOOL nativeShouldEnterFullscreen;
+@property(nonatomic) BOOL nativeReentrySuppressed;
+@property(nonatomic) BOOL nativeSuppressedPlaybackObserved;
 @property(nonatomic, strong) NSTextField *addressField;
 @property(nonatomic, strong) NSTextField *statusLabel;
 @property(nonatomic, strong) NSProgressIndicator *progressIndicator;
@@ -161,6 +176,12 @@ static BOOL TGLoadMacAVKit(void) {
 - (void)refreshTouchBarPresentation;
 - (void)updateSafariEscapeKey;
 - (void)clearMediaControls;
+- (void)prepareNativePlaybackFromState:(NSDictionary *)state;
+- (void)stopNativePlayback;
+- (void)returnNativePlaybackToWebPage;
+- (void)syncNativePlaybackState;
+- (void)downloadNativeMedia:(id)sender;
+- (void)beginVidCatchDownload:(NSDictionary *)message;
 
 @end
 
@@ -679,6 +700,43 @@ static BOOL TGLoadMacAVKit(void) {
     self.webView.translatesAutoresizingMaskIntoConstraints = NO;
     [content addSubview:self.webView];
 
+    self.nativePlayerView = [[AVPlayerView alloc] initWithFrame:NSZeroRect];
+    self.nativePlayerView.controlsStyle = AVPlayerViewControlsStyleFloating;
+    self.nativePlayerView.videoGravity = AVLayerVideoGravityResizeAspect;
+    self.nativePlayerView.showsFullScreenToggleButton = YES;
+    self.nativePlayerView.allowsPictureInPicturePlayback = YES;
+    self.nativePlayerView.updatesNowPlayingInfoCenter = YES;
+    self.nativePlayerView.delegate = self;
+    if (@available(macOS 13.0, *)) self.nativePlayerView.allowsVideoFrameAnalysis = NO;
+    self.nativePlayerView.wantsLayer = YES;
+    self.nativePlayerView.layer.backgroundColor = NSColor.blackColor.CGColor;
+    self.nativePlayerView.hidden = YES;
+    self.nativePlayerView.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:self.nativePlayerView];
+
+    NSView *nativeOverlay = self.nativePlayerView.contentOverlayView;
+    if (nativeOverlay != nil) {
+        NSImage *downloadImage = [NSImage imageWithSystemSymbolName:@"arrow.down"
+                                          accessibilityDescription:@"下载当前视频"];
+        self.nativeDownloadButton = [NSButton buttonWithImage:downloadImage
+                                                      target:self
+                                                      action:@selector(downloadNativeMedia:)];
+        self.nativeDownloadButton.bezelStyle = NSBezelStyleCircular;
+        self.nativeDownloadButton.bezelColor = NSColor.systemBlueColor;
+        self.nativeDownloadButton.contentTintColor = NSColor.whiteColor;
+        self.nativeDownloadButton.toolTip = @"用 VidCatch 下载当前视频";
+        self.nativeDownloadButton.translatesAutoresizingMaskIntoConstraints = NO;
+        [nativeOverlay addSubview:self.nativeDownloadButton];
+        [NSLayoutConstraint activateConstraints:@[
+            [self.nativeDownloadButton.trailingAnchor constraintEqualToAnchor:nativeOverlay.trailingAnchor
+                                                                      constant:-18.0],
+            [self.nativeDownloadButton.bottomAnchor constraintEqualToAnchor:nativeOverlay.bottomAnchor
+                                                                    constant:-76.0],
+            [self.nativeDownloadButton.widthAnchor constraintEqualToConstant:44.0],
+            [self.nativeDownloadButton.heightAnchor constraintEqualToConstant:44.0]
+        ]];
+    }
+
     self.classicHomeView = [self buildClassicHome];
     [content addSubview:self.classicHomeView];
 
@@ -756,6 +814,11 @@ static BOOL TGLoadMacAVKit(void) {
         [self.webView.topAnchor constraintEqualToAnchor:topBar.bottomAnchor],
         [self.webView.bottomAnchor constraintEqualToAnchor:bottomBar.topAnchor],
 
+        [self.nativePlayerView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [self.nativePlayerView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [self.nativePlayerView.topAnchor constraintEqualToAnchor:topBar.bottomAnchor],
+        [self.nativePlayerView.bottomAnchor constraintEqualToAnchor:bottomBar.topAnchor],
+
         [bottomBar.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
         [bottomBar.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
         [bottomBar.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
@@ -785,6 +848,7 @@ static BOOL TGLoadMacAVKit(void) {
 }
 
 - (void)dealloc {
+    [self stopNativePlayback];
     for (NSString *keyPath in @[@"URL", @"title", @"loading", @"estimatedProgress", @"canGoBack", @"canGoForward"]) {
         @try {
             [self.webView removeObserver:self forKeyPath:keyPath];
@@ -799,6 +863,21 @@ static BOOL TGLoadMacAVKit(void) {
                        context:(void *)context {
     (void)change;
     (void)context;
+    if (object == self.nativePlayerItem && [keyPath isEqualToString:@"status"]) {
+        AVPlayerItem *item = (AVPlayerItem *)object;
+        if (item.status == AVPlayerItemStatusReadyToPlay) {
+            [self activateNativePlaybackForItem:item];
+        } else if (item.status == AVPlayerItemStatusFailed) {
+            NSURL *failedURL = self.nativeMediaURL;
+            NSString *message = item.error.localizedDescription ?: @"原生播放器无法打开该视频";
+            BOOL wasActive = self.nativePlaybackActive;
+            [self stopNativePlayback];
+            self.nativeMediaURL = failedURL;
+            self.statusLabel.stringValue = message;
+            if (wasActive) [self evaluateCommand:@"play" value:nil];
+        }
+        return;
+    }
     if (object == self.webView) {
         [self updateNavigationUI];
         return;
@@ -859,6 +938,7 @@ static BOOL TGLoadMacAVKit(void) {
         self.statusLabel.stringValue = @"网址无效";
         return;
     }
+    [self stopNativePlayback];
     [self showWebContent];
     [self.webView loadRequest:[NSURLRequest requestWithURL:URL
                                                cachePolicy:NSURLRequestUseProtocolCachePolicy
@@ -873,9 +953,11 @@ static BOOL TGLoadMacAVKit(void) {
 }
 
 - (void)showClassicHome {
+    [self stopNativePlayback];
     self.showingClassicHome = YES;
     self.classicHomeView.hidden = NO;
     self.webView.hidden = YES;
+    self.nativePlayerView.hidden = YES;
     self.backButton.hidden = YES;
     self.favoriteButton.hidden = YES;
     self.classicTitleLabel.stringValue = @"草榴社區";
@@ -886,7 +968,8 @@ static BOOL TGLoadMacAVKit(void) {
 - (void)showWebContent {
     self.showingClassicHome = NO;
     self.classicHomeView.hidden = YES;
-    self.webView.hidden = NO;
+    self.webView.hidden = self.nativePlaybackActive;
+    self.nativePlayerView.hidden = !self.nativePlaybackActive;
     self.backButton.hidden = NO;
     self.favoriteButton.hidden = NO;
     [self updateFavoriteUI];
@@ -1130,6 +1213,9 @@ static BOOL TGLoadMacAVKit(void) {
 - (void)goBack:(id)sender {
     (void)sender;
     if (self.showingClassicHome) return;
+    self.nativeReentrySuppressed = NO;
+    self.nativeSuppressedPlaybackObserved = NO;
+    [self stopNativePlayback];
     if (self.webView.canGoBack) {
         [self.webView goBack];
     } else {
@@ -1152,6 +1238,247 @@ static BOOL TGLoadMacAVKit(void) {
 - (void)toggleWindowFullscreen:(id)sender {
     (void)sender;
     [self.window toggleFullScreen:nil];
+}
+
+#pragma mark - Native AVKit playback
+
+- (NSArray<NSHTTPCookie *> *)cookies:(NSArray<NSHTTPCookie *> *)cookies
+                         matchingURL:(NSURL *)URL {
+    NSString *host = URL.host.lowercaseString ?: @"";
+    NSString *path = URL.path.length > 0 ? URL.path : @"/";
+    BOOL secure = [URL.scheme.lowercaseString isEqualToString:@"https"];
+    NSMutableArray<NSHTTPCookie *> *matches = [NSMutableArray array];
+    for (NSHTTPCookie *cookie in cookies) {
+        NSString *domain = cookie.domain.lowercaseString ?: @"";
+        if ([domain hasPrefix:@"."]) domain = [domain substringFromIndex:1];
+        BOOL domainMatches = [host isEqualToString:domain] ||
+            (domain.length > 0 && [host hasSuffix:[@"." stringByAppendingString:domain]]);
+        BOOL pathMatches = cookie.path.length == 0 || [path hasPrefix:cookie.path];
+        if (domainMatches && pathMatches && (!cookie.secure || secure)) [matches addObject:cookie];
+    }
+    return matches;
+}
+
+- (void)prepareNativePlaybackFromState:(NSDictionary *)state {
+    NSString *rawURL = [state[@"nativeURL"] isKindOfClass:NSString.class]
+        ? state[@"nativeURL"]
+        : @"";
+    NSURL *URL = [NSURL URLWithString:rawURL];
+    if (URL == nil || ![@[@"http", @"https"] containsObject:URL.scheme.lowercaseString]) return;
+    if ([self.nativeMediaURL isEqual:URL]) return;
+
+    [self stopNativePlayback];
+    self.nativeMediaURL = URL;
+    self.nativePendingStartTime = [state[@"currentTime"] respondsToSelector:@selector(doubleValue)]
+        ? MAX([state[@"currentTime"] doubleValue], 0.0)
+        : 0.0;
+    self.nativeShouldEnterFullscreen = [state[@"fullscreen"] respondsToSelector:@selector(boolValue)]
+        ? [state[@"fullscreen"] boolValue]
+        : NO;
+    NSString *pageURL = [state[@"pageURL"] isKindOfClass:NSString.class] ? state[@"pageURL"] : @"";
+    NSString *userAgent = [state[@"userAgent"] isKindOfClass:NSString.class] ? state[@"userAgent"] : @"";
+    NSString *title = [state[@"title"] isKindOfClass:NSString.class] ? state[@"title"] : @"小草视频";
+    NSString *extension = URL.pathExtension.lowercaseString;
+    NSString *kind = [extension isEqualToString:@"m3u8"]
+        ? @"hls"
+        : ([extension isEqualToString:@"mpd"] ? @"dash" : @"direct");
+    self.nativeDownloadMessage = @{
+        @"url": URL.absoluteString ?: @"",
+        @"kind": kind,
+        @"source": @"native-player",
+        @"title": title,
+        @"pageUrl": pageURL,
+        @"userAgent": userAgent
+    };
+
+    NSUInteger generation = ++self.nativePlaybackGeneration;
+    __weak typeof(self) weakSelf = self;
+    [self.webView.configuration.websiteDataStore.httpCookieStore
+        getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil || generation != strongSelf.nativePlaybackGeneration ||
+                ![strongSelf.nativeMediaURL isEqual:URL]) return;
+
+            NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+            if (userAgent.length > 0) headers[@"User-Agent"] = userAgent;
+            if (pageURL.length > 0) headers[@"Referer"] = pageURL;
+            NSArray<NSHTTPCookie *> *matchingCookies = [strongSelf cookies:cookies matchingURL:URL];
+            NSString *cookieHeader = [NSHTTPCookie requestHeaderFieldsWithCookies:matchingCookies][@"Cookie"];
+            if (cookieHeader.length > 0) headers[@"Cookie"] = cookieHeader;
+
+            NSDictionary *options = headers.count > 0
+                ? @{@"AVURLAssetHTTPHeaderFieldsKey": headers}
+                : @{};
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:URL options:options];
+            AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
+            strongSelf.nativePlayerItem = item;
+            strongSelf.nativePlayer = [AVPlayer playerWithPlayerItem:item];
+            strongSelf.nativePlayer.automaticallyWaitsToMinimizeStalling = YES;
+            strongSelf.nativePlayerView.player = strongSelf.nativePlayer;
+            strongSelf.observingNativePlayerItem = YES;
+            [item addObserver:strongSelf
+                   forKeyPath:@"status"
+                      options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew
+                      context:NULL];
+        });
+    }];
+}
+
+- (void)activateNativePlaybackForItem:(AVPlayerItem *)item {
+    if (item != self.nativePlayerItem || self.nativePlaybackActive ||
+        item.status != AVPlayerItemStatusReadyToPlay) return;
+    NSUInteger generation = self.nativePlaybackGeneration;
+    CMTime start = CMTimeMakeWithSeconds(self.nativePendingStartTime, 1000);
+    __weak typeof(self) weakSelf = self;
+    [self.nativePlayer seekToTime:start
+                 toleranceBefore:kCMTimeZero
+                  toleranceAfter:kCMTimeZero
+               completionHandler:^(BOOL finished) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!finished || strongSelf == nil || generation != strongSelf.nativePlaybackGeneration ||
+                item != strongSelf.nativePlayerItem) return;
+            BOOL shouldEnterFullscreen = strongSelf.nativeShouldEnterFullscreen || strongSelf.fullscreen;
+            [strongSelf evaluateCommand:@"exitFullscreen" value:nil];
+            [strongSelf evaluateCommand:@"pause" value:nil];
+            strongSelf.fullscreen = NO;
+            strongSelf.nativePlaybackActive = YES;
+            strongSelf.webView.hidden = YES;
+            strongSelf.nativePlayerView.hidden = NO;
+            [strongSelf.window makeFirstResponder:strongSelf.nativePlayerView];
+
+            if (strongSelf.nativeTimeObserver == nil) {
+                strongSelf.nativeTimeObserver = [strongSelf.nativePlayer
+                    addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.5, 600)
+                                               queue:dispatch_get_main_queue()
+                                          usingBlock:^(__unused CMTime time) {
+                    [weakSelf syncNativePlaybackState];
+                }];
+            }
+            [strongSelf.nativePlayer play];
+            [strongSelf syncNativePlaybackState];
+            [strongSelf refreshTouchBarPresentation];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                typeof(self) currentSelf = weakSelf;
+                if (currentSelf.nativePlaybackActive) [currentSelf refreshTouchBarPresentation];
+            });
+            if (shouldEnterFullscreen) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    typeof(self) currentSelf = weakSelf;
+                    if (currentSelf.nativePlaybackActive && !currentSelf.mediaCinemaFullscreen &&
+                        !currentSelf.fullscreen) {
+                        [currentSelf enterCinemaFullscreenFallback];
+                    }
+                });
+            }
+        });
+    }];
+}
+
+- (void)syncNativePlaybackState {
+    if (!self.nativePlaybackActive || self.nativePlayer == nil) return;
+    double elapsed = CMTimeGetSeconds(self.nativePlayer.currentTime);
+    double duration = CMTimeGetSeconds(self.nativePlayer.currentItem.duration);
+    self.elapsed = isfinite(elapsed) ? MAX(elapsed, 0.0) : 0.0;
+    self.duration = isfinite(duration) && duration > 0.0 ? duration : 0.0;
+    self.paused = self.nativePlayer.timeControlStatus == AVPlayerTimeControlStatusPaused;
+    if (@available(macOS 13.0, *)) {
+        self.defaultPlaybackRate = self.nativePlayer.defaultRate > 0.0
+            ? self.nativePlayer.defaultRate
+            : 1.0;
+    } else {
+        self.defaultPlaybackRate = self.nativePlayer.rate > 0.0
+            ? self.nativePlayer.rate
+            : 1.0;
+    }
+    self.pictureInPictureAvailable = NO;
+    [self refreshAVKitTimingWithRate:self.paused ? 0.0 : MAX(self.defaultPlaybackRate, 0.1)];
+    [self installTouchBarIfNeeded];
+    [self updateTouchBar];
+}
+
+- (void)stopNativePlayback {
+    self.nativePlaybackGeneration += 1;
+    if (self.nativeTimeObserver != nil && self.nativePlayer != nil) {
+        [self.nativePlayer removeTimeObserver:self.nativeTimeObserver];
+    }
+    self.nativeTimeObserver = nil;
+    if (self.observingNativePlayerItem && self.nativePlayerItem != nil) {
+        @try {
+            [self.nativePlayerItem removeObserver:self forKeyPath:@"status"];
+        } @catch (__unused NSException *exception) {}
+    }
+    self.observingNativePlayerItem = NO;
+    [self.nativePlayer pause];
+    if (self.nativePlayerView.touchBar == self.touchBar) self.nativePlayerView.touchBar = nil;
+    self.nativePlayerView.player = nil;
+    self.nativePlayerView.hidden = YES;
+    self.nativePlayer = nil;
+    self.nativePlayerItem = nil;
+    self.nativePlaybackActive = NO;
+    self.nativeShouldEnterFullscreen = NO;
+    self.nativeMediaURL = nil;
+    self.nativeDownloadMessage = nil;
+    self.webView.hidden = self.showingClassicHome;
+    if (!self.showingClassicHome) [self.window makeFirstResponder:self.webView];
+}
+
+- (void)returnNativePlaybackToWebPage {
+    if (!self.nativePlaybackActive || self.nativePlayer == nil) return;
+    double currentTime = CMTimeGetSeconds(self.nativePlayer.currentTime);
+    BOOL shouldResume = self.nativePlayer.timeControlStatus != AVPlayerTimeControlStatusPaused;
+    if (!isfinite(currentTime)) currentTime = self.elapsed;
+
+    // The webpage remains alive and keeps its scroll/navigation state while
+    // AVKit is visible. Give the current time back to its video element, then
+    // remove the native overlay so exiting fullscreen returns to that page.
+    self.nativeReentrySuppressed = shouldResume;
+    self.nativeSuppressedPlaybackObserved = NO;
+    [self stopNativePlayback];
+    [self evaluateCommand:@"seek" value:@(MAX(currentTime, 0.0))];
+    [self evaluateCommand:shouldResume ? @"play" : @"pause" value:nil];
+    [self.window makeFirstResponder:self.webView];
+    [self updateNavigationUI];
+}
+
+- (void)downloadNativeMedia:(id)sender {
+    (void)sender;
+    if (self.nativeDownloadMessage != nil) [self beginVidCatchDownload:self.nativeDownloadMessage];
+}
+
+- (void)playerViewWillEnterFullScreen:(AVPlayerView *)playerView {
+    (void)playerView;
+    self.fullscreen = YES;
+    [self updateTouchBar];
+}
+
+- (void)playerViewDidEnterFullScreen:(AVPlayerView *)playerView {
+    (void)playerView;
+    self.fullscreen = YES;
+    [self refreshTouchBarPresentation];
+}
+
+- (void)playerViewWillExitFullScreen:(AVPlayerView *)playerView {
+    (void)playerView;
+    self.fullscreen = NO;
+    [self updateTouchBar];
+}
+
+- (void)playerViewDidExitFullScreen:(AVPlayerView *)playerView {
+    (void)playerView;
+    self.fullscreen = NO;
+    [self returnNativePlaybackToWebPage];
+    [self refreshTouchBarPresentation];
+}
+
+- (void)playerView:(AVPlayerView *)playerView
+    restoreUserInterfaceForFullScreenExitWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    (void)playerView;
+    [self.window makeKeyAndOrderFront:nil];
+    if (completionHandler != nil) completionHandler(YES);
 }
 
 #pragma mark - WebKit navigation
@@ -1211,6 +1538,14 @@ static BOOL TGLoadMacAVKit(void) {
     (void)navigation;
     [self recordCurrentPageInHistory];
     [self updateNavigationUI];
+}
+
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+    (void)webView;
+    (void)navigation;
+    self.nativeReentrySuppressed = NO;
+    self.nativeSuppressedPlaybackObserved = NO;
+    if (self.nativePlaybackActive || self.nativePlayerItem != nil) [self stopNativePlayback];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1304,6 +1639,12 @@ static BOOL TGLoadMacAVKit(void) {
     NSString *type = [body[@"type"] isKindOfClass:NSString.class] ? body[@"type"] : @"";
     if ([type isEqualToString:@"state"]) {
         self.mediaFrame = message.frameInfo;
+        if (self.nativePlayerItem != nil &&
+            [body[@"fullscreen"] respondsToSelector:@selector(boolValue)] &&
+            [body[@"fullscreen"] boolValue]) {
+            self.nativeShouldEnterFullscreen = YES;
+        }
+        if (self.nativePlaybackActive) return;
         self.elapsed = [body[@"currentTime"] respondsToSelector:@selector(doubleValue)]
             ? [body[@"currentTime"] doubleValue]
             : 0;
@@ -1322,6 +1663,16 @@ static BOOL TGLoadMacAVKit(void) {
         self.fullscreen = [body[@"fullscreen"] respondsToSelector:@selector(boolValue)]
             ? [body[@"fullscreen"] boolValue]
             : NO;
+        if (self.nativeReentrySuppressed) {
+            if (!self.paused) {
+                self.nativeSuppressedPlaybackObserved = YES;
+            } else if (self.nativeSuppressedPlaybackObserved) {
+                // The restored web playback has now completed a pause cycle;
+                // a later user-initiated play may enter native mode again.
+                self.nativeReentrySuppressed = NO;
+                self.nativeSuppressedPlaybackObserved = NO;
+            }
+        }
         if (self.fullscreen) self.mediaFullscreenRequestGeneration += 1;
         double playbackRate = [body[@"rate"] respondsToSelector:@selector(doubleValue)]
             ? MAX([body[@"rate"] doubleValue], 0.0)
@@ -1332,6 +1683,9 @@ static BOOL TGLoadMacAVKit(void) {
         [self installTouchBarIfNeeded];
         [self updateSafariEscapeKey];
         [self updateTouchBar];
+        if (!self.paused && self.nativePlayerItem == nil && !self.nativeReentrySuppressed) {
+            [self prepareNativePlaybackFromState:body];
+        }
     } else if ([type isEqualToString:@"clear"] && message.frameInfo.isMainFrame) {
         // BrowserBridge runs in every iframe. Ad/player iframe reloads must not
         // tear down the active Touch Bar while the visible video keeps playing.
@@ -1417,21 +1771,21 @@ static BOOL TGLoadMacAVKit(void) {
     __weak typeof(self) weakSelf = self;
     [commands.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         (void)event;
-        [weakSelf evaluateCommand:@"play" value:nil];
+        [weakSelf setPlaying:YES];
         return weakSelf.duration > 0.0
             ? MPRemoteCommandHandlerStatusSuccess
             : MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
     }];
     [commands.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         (void)event;
-        [weakSelf evaluateCommand:@"pause" value:nil];
+        [weakSelf setPlaying:NO];
         return weakSelf.duration > 0.0
             ? MPRemoteCommandHandlerStatusSuccess
             : MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
     }];
     [commands.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         (void)event;
-        [weakSelf evaluateCommand:@"toggle" value:nil];
+        [weakSelf togglePlayback];
         return weakSelf.duration > 0.0
             ? MPRemoteCommandHandlerStatusSuccess
             : MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
@@ -1441,7 +1795,7 @@ static BOOL TGLoadMacAVKit(void) {
             return MPRemoteCommandHandlerStatusCommandFailed;
         }
         NSTimeInterval position = ((MPChangePlaybackPositionCommandEvent *)event).positionTime;
-        [weakSelf evaluateCommand:@"seek" value:@(position)];
+        [weakSelf seekToTime:position toleranceBefore:0.0 toleranceAfter:0.0];
         return weakSelf.duration > 0.0
             ? MPRemoteCommandHandlerStatusSuccess
             : MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
@@ -1490,7 +1844,13 @@ static BOOL TGLoadMacAVKit(void) {
     if (playing == [self isPlaying]) return;
     self.paused = !playing;
     [self refreshAVKitTimingWithRate:playing ? MAX(self.defaultPlaybackRate, 0.1) : 0.0];
-    [self evaluateCommand:playing ? @"play" : @"pause" value:nil];
+    if (self.nativePlaybackActive) {
+        if (playing) [self.nativePlayer play];
+        else [self.nativePlayer pause];
+        [self syncNativePlaybackState];
+    } else {
+        [self evaluateCommand:playing ? @"play" : @"pause" value:nil];
+    }
 }
 
 - (void)togglePlayback {
@@ -1558,7 +1918,13 @@ static BOOL TGLoadMacAVKit(void) {
     if (!isfinite(time) || ![self canSeek]) return;
     self.elapsed = MIN(MAX(time, 0.0), self.duration);
     [self refreshAVKitTimingWithRate:self.paused ? 0.0 : MAX(self.defaultPlaybackRate, 0.1)];
-    [self evaluateCommand:@"seek" value:@(self.elapsed)];
+    if (self.nativePlaybackActive) {
+        [self.nativePlayer seekToTime:CMTimeMakeWithSeconds(self.elapsed, 1000)
+                     toleranceBefore:kCMTimeZero
+                      toleranceAfter:kCMTimeZero];
+    } else {
+        [self evaluateCommand:@"seek" value:@(self.elapsed)];
+    }
 }
 
 - (BOOL)canBeginTouchBarScrubbing {
@@ -1710,7 +2076,19 @@ static BOOL TGLoadMacAVKit(void) {
         ? [existingIdentifiers mutableCopy]
         : [NSMutableArray array];
     [identifiers removeObject:identifier];
-    [identifiers addObject:identifier];
+    // Keep the toggle before AppKit's trailing proxy/flexible items. AVKit can
+    // append those during fullscreen; an item after them may be valid but sit
+    // outside the visible hardware region.
+    NSUInteger insertionIndex = identifiers.count;
+    for (NSUInteger index = 0; index < identifiers.count; index += 1) {
+        NSString *candidate = [identifiers[index] description];
+        if ([candidate containsString:@"OtherItemsProxy"] ||
+            [candidate containsString:@"FlexibleSpace"]) {
+            insertionIndex = index;
+            break;
+        }
+    }
+    [identifiers insertObject:identifier atIndex:insertionIndex];
     TGSendObject(self.touchBar, NSSelectorFromString(@"setDefaultItemIdentifiers:"), identifiers);
     [self updateFullscreenButton];
 }
@@ -1760,6 +2138,14 @@ static BOOL TGLoadMacAVKit(void) {
             : hostWindow.touchBar;
     }
     if (hostWindow.touchBar != self.touchBar) hostWindow.touchBar = self.touchBar;
+
+    // AVPlayerView publishes its own Touch Bar when playback begins and again
+    // while AppKit moves a window into a fullscreen Space. That view-owned bar
+    // wins before NSWindow in the responder chain, so explicitly keep the
+    // Safari-style provider bar on the native player as well as the window.
+    if (self.nativePlaybackActive && self.nativePlayerView.touchBar != self.touchBar) {
+        self.nativePlayerView.touchBar = self.touchBar;
+    }
 
     // AppKit resolves a Touch Bar through the first-responder chain before it
     // falls back to NSWindow.touchBar. WKWebView installs its own responder
@@ -1945,7 +2331,7 @@ static BOOL TGLoadMacAVKit(void) {
 
 - (void)touchBarPlayPausePressed:(id)sender {
     (void)sender;
-    [self evaluateCommand:@"toggle" value:nil];
+    [self togglePlayback];
 }
 
 - (void)touchBarPictureInPicturePressed:(id)sender {
@@ -1958,14 +2344,13 @@ static BOOL TGLoadMacAVKit(void) {
 }
 
 - (void)touchBarExitFullscreenPressed:(id)sender {
-    if (self.mediaCinemaFullscreen) [self toggleMediaFullscreen:sender];
+    if (self.nativePlaybackActive || self.mediaCinemaFullscreen) [self toggleMediaFullscreen:sender];
     else [self evaluateCommand:@"exitFullscreen" value:nil];
 }
 
 - (void)touchBarSliderChanged:(id)sender {
     double value = TGGetDouble(sender, NSSelectorFromString(@"doubleValue"));
-    self.elapsed = value;
-    [self evaluateCommand:@"seek" value:@(value)];
+    [self seekToTime:value toleranceBefore:0.0 toleranceAfter:0.0];
     [self publishNowPlayingTitle:self.title rate:self.paused ? 0.0 : 1.0];
 }
 
@@ -1986,6 +2371,9 @@ static BOOL TGLoadMacAVKit(void) {
 }
 
 - (void)clearMediaControls {
+    self.nativeReentrySuppressed = NO;
+    self.nativeSuppressedPlaybackObserved = NO;
+    [self stopNativePlayback];
     MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo = nil;
     MPNowPlayingInfoCenter.defaultCenter.playbackState = MPNowPlayingPlaybackStateStopped;
     if (self.touchBarProvider != nil &&
@@ -2039,8 +2427,10 @@ static BOOL TGLoadMacAVKit(void) {
 
 - (void)leaveCinemaFullscreen {
     self.mediaFullscreenRequestGeneration += 1;
-    [self evaluateCommand:@"cinema" value:@NO];
-    [self evaluateTopFrameCommand:@"hostCinema" value:@NO];
+    if (!self.nativePlaybackActive) {
+        [self evaluateCommand:@"cinema" value:@NO];
+        [self evaluateTopFrameCommand:@"hostCinema" value:@NO];
+    }
     [self setCinemaChromeHidden:NO];
     self.mediaCinemaFullscreen = NO;
     [self updateTouchBar];
@@ -2049,8 +2439,10 @@ static BOOL TGLoadMacAVKit(void) {
 - (void)enterCinemaFullscreenFallback {
     if (self.mediaCinemaFullscreen || self.fullscreen) return;
     self.mediaCinemaFullscreen = YES;
-    [self evaluateCommand:@"cinema" value:@YES];
-    [self evaluateTopFrameCommand:@"hostCinema" value:@YES];
+    if (!self.nativePlaybackActive) {
+        [self evaluateCommand:@"cinema" value:@YES];
+        [self evaluateTopFrameCommand:@"hostCinema" value:@YES];
+    }
     [self setCinemaChromeHidden:YES];
     if ((self.window.styleMask & NSWindowStyleMaskFullScreen) == 0) {
         [self.window toggleFullScreen:nil];
@@ -2060,6 +2452,22 @@ static BOOL TGLoadMacAVKit(void) {
 
 - (void)toggleMediaFullscreen:(id)sender {
     (void)sender;
+    if (self.nativePlaybackActive) {
+        if (self.mediaCinemaFullscreen) {
+            if ((self.window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+                [self.window toggleFullScreen:nil];
+            } else {
+                [self leaveCinemaFullscreen];
+                [self returnNativePlaybackToWebPage];
+            }
+        } else if (self.fullscreen) {
+            NSWindow *hostWindow = [self activeTouchBarHostWindow];
+            [hostWindow toggleFullScreen:nil];
+        } else {
+            [self enterCinemaFullscreenFallback];
+        }
+        return;
+    }
     if (self.mediaCinemaFullscreen) {
         self.mediaFullscreenRequestGeneration += 1;
         if ((self.window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
@@ -2093,7 +2501,7 @@ static BOOL TGLoadMacAVKit(void) {
 
 - (void)windowDidEnterFullScreen:(NSNotification *)notification {
     (void)notification;
-    if (self.mediaCinemaFullscreen) {
+    if (self.mediaCinemaFullscreen && !self.nativePlaybackActive) {
         [self evaluateCommand:@"cinema" value:@YES];
         [self evaluateTopFrameCommand:@"hostCinema" value:@YES];
         [self setCinemaChromeHidden:YES];
@@ -2103,11 +2511,17 @@ static BOOL TGLoadMacAVKit(void) {
                    dispatch_get_main_queue(), ^{
         [self refreshTouchBarPresentation];
     });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.nativePlaybackActive) [self refreshTouchBarPresentation];
+    });
 }
 
 - (void)windowDidExitFullScreen:(NSNotification *)notification {
     (void)notification;
+    BOOL shouldReturnToWebPage = self.mediaCinemaFullscreen && self.nativePlaybackActive;
     if (self.mediaCinemaFullscreen) [self leaveCinemaFullscreen];
+    if (shouldReturnToWebPage) [self returnNativePlaybackToWebPage];
     [self refreshTouchBarPresentation];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

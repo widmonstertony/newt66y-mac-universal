@@ -3,11 +3,11 @@ set -euo pipefail
 
 root_dir="${0:A:h}"
 repo="widmonstertony/newt66y-mac-universal"
-tag="v1.3.0"
-release_name="小草 Mac 浏览器 v1.3.0"
-asset="$root_dir/dist/NewT66y-Mac-Universal-v1.3.0.zip"
+tag="v1.4.0"
+release_name="小草 Mac 浏览器 v1.4.0"
+asset="$root_dir/dist/NewT66y-Mac-Universal-v1.4.0.zip"
 checksum="$root_dir/dist/SHA256SUMS.txt"
-notes="$root_dir/release-notes-v1.3.0.md"
+notes="$root_dir/release-notes-v1.4.0.md"
 
 credential="$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null || true)"
 github_token=""

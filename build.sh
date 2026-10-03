@@ -8,7 +8,7 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/NewT66yIntel"
-ZIP_PATH="$ROOT_DIR/dist/NewT66y-Mac-Universal-v1.3.0.zip"
+ZIP_PATH="$ROOT_DIR/dist/NewT66y-Mac-Universal-v1.4.0.zip"
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 MODULE_CACHE_DIR="$ROOT_DIR/.build/ModuleCache"
 
@@ -30,6 +30,7 @@ xcrun clang \
   -framework Security \
   -framework MediaPlayer \
   -framework AVFoundation \
+  -framework AVKit \
   -framework CoreMedia \
   -o "$EXECUTABLE"
 

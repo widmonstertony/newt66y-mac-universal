@@ -84,6 +84,12 @@
     var now = Date.now();
     if (!force && now - lastStateAt < 350) return;
     lastStateAt = now;
+    var currentSource = video.currentSrc || video.src || "";
+    var nativeURL = absoluteURL(currentSource);
+    if (!nativeURL || !mediaKind(nativeURL)) {
+      var candidate = bestCandidate();
+      nativeURL = candidate && candidate.url ? candidate.url : null;
+    }
     post({
       type: "state",
       currentTime: finite(video.currentTime),
@@ -99,7 +105,10 @@
       fullscreen: !!document.fullscreenElement || !!video.webkitDisplayingFullscreen ||
         video.webkitPresentationMode === "fullscreen",
       title: document.title || "小草视频",
-      src: video.currentSrc || video.src || location.href
+      src: currentSource || location.href,
+      nativeURL: nativeURL || "",
+      pageURL: location.href,
+      userAgent: navigator.userAgent || ""
     });
   }
 
@@ -273,6 +282,7 @@
         ".dplayer-playing .dplayer-mobile-play," +
         ".dplayer-playing .dplayer-bezel{" +
         "display:none!important;opacity:0!important;visibility:hidden!important;pointer-events:none!important}" +
+        ".dplayer-playing video{cursor:none!important}" +
         ".dplayer .dplayer-controller .dplayer-icons-right .dplayer-full{" +
         "display:inline-flex!important;visibility:visible!important;opacity:1!important;" +
         "position:absolute!important;right:4px!important;bottom:0!important;z-index:999999!important;" +
@@ -576,6 +586,10 @@
     refreshAvailability();
   }
 
+  function frameHasDownloadableMedia() {
+    return !!document.querySelector("video,audio") || !!bestCandidate();
+  }
+
   window.addEventListener("message", function (event) {
     var data = event.data;
     if (!data || data.__tonyGrassCommand !== true) return;
@@ -682,9 +696,9 @@
 
   function start() {
     cleanEmbeddedPlayerChrome();
-    installUI();
     scan(document);
     scanPerformance();
+    if (frameHasDownloadableMedia()) installUI();
   }
 
   if (document.readyState === "loading") {
@@ -696,12 +710,13 @@
   new MutationObserver(function (mutations) {
     mutations.forEach(function (mutation) { mutation.addedNodes.forEach(scan); });
     cleanEmbeddedPlayerChrome();
-    if (!document.getElementById("__tonyVidCatchButton")) installUI();
+    if (!document.getElementById("__tonyVidCatchButton") && frameHasDownloadableMedia()) installUI();
   }).observe(document.documentElement || document, { childList: true, subtree: true });
 
   setInterval(function () {
     scan(document);
     scanPerformance();
-    refreshAvailability();
+    if (!button && frameHasDownloadableMedia()) installUI();
+    else refreshAvailability();
   }, 2500);
 })();
