@@ -1,0 +1,4 @@
+.DS_Store
+.build/
+dist/
+release-notes-v1.2*.md
